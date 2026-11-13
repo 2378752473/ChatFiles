@@ -5,7 +5,8 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-VERSION='0.2.5'
+VERSION='0.2.8'
+WORKSPACE_NOTICE = 'AI 对话关联的工作目录可能包含源码、报告、实验结果和原始素材。请先核对文件用途，再清理确认不再需要的内容。'
 def normal(p): return os.path.normcase(os.path.abspath(str(p).removeprefix('\\\\?\\')))
 def inside(p, root):
     try: return os.path.commonpath([normal(p),normal(root)])==normal(root)
@@ -159,9 +160,32 @@ TYPE_BY_SUFFIX = {ext: label for label, extensions in FILE_TYPES.items() for ext
 def file_type(path):
     return TYPE_BY_SUFFIX.get(Path(path).suffix.lower(), '其他')
 
+def configure_windows_dpi():
+    if sys.platform == 'win32':
+        # Tk 8.6 uses system DPI. Call before creating any window.
+        ctypes.windll.user32.SetProcessDPIAware()
+
+
+def desktop_size(root):
+    if sys.platform == 'win32':
+        from ctypes.wintypes import RECT
+        area = RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(area), 0):
+            return area.right - area.left, area.bottom - area.top
+    return root.winfo_screenwidth(), root.winfo_screenheight()
+
+
 class App:
     def __init__(self,root):
-        self.root=root;root.title('ChatFiles · 按对话整理文件  '+VERSION);root.geometry('1280x820');root.minsize(950,640)
+        self.root = root
+        root.title('ChatFiles · 对话文件管理')
+        self.scale = float(root.tk.call('tk','scaling')) / (96 / 72)
+        screen_w, screen_h = desktop_size(root)
+        width = min(self.px(1260), max(440, screen_w - self.px(32)))
+        height = min(self.px(790), max(360, screen_h - self.px(64)))
+        root.geometry(f'{width}x{height}')
+        root.minsize(min(self.px(790),width),min(self.px(500),height))
+        root.configure(background='#f1f5fa')
         self.events=queue.Queue();self.threads=[];self.cache={};self.sizes={};self.active=None;self.files=[];self.busy=False;self.thread_keys={};self.file_keys={};self.path_counts={};self.path_related={}
         self.loaded_db = None
         self.db=tk.StringVar(value=detect());self.query=tk.StringVar();self.status=tk.StringVar(value='准备就绪。只读扫描；所有清理需单独确认。')
@@ -174,83 +198,174 @@ class App:
         self.byte_totals = {}
         self.total_info = tk.StringVar(value='对话大小合计　—')
         self.total_detail = tk.StringVar(value='共享目录和已计入的子目录只统计一次。')
-        style = ttk.Style(root)
-        style.theme_use('clam')
-        style.configure('.', font=('Microsoft YaHei UI', 10), background='#eef4ff', foreground='#14274a')
-        style.configure('Treeview', rowheight=30, background='white', fieldbackground='white', borderwidth=0)
-        style.configure('Treeview.Heading', font=('Microsoft YaHei UI', 10, 'bold'), background='#dce9ff', relief='flat', padding=7)
-        style.map('Treeview', background=[('selected','#195bd0')], foreground=[('selected','white')])
-        style.configure('TButton', padding=(10,6))
-        for role, background, hover in [('Blue','#1857db','#1245b7'), ('Danger','#ce223e','#aa1530')]:
-            button = role + '.TButton'
-            style.configure(button, background=background, foreground='white', bordercolor=background, lightcolor=background, darkcolor=background)
-            style.map(button, background=[('disabled','#dce3ef'),('pressed',hover),('active',hover)], foreground=[('disabled','#65758f'),('!disabled','white')])
-        style.configure('Brand.TFrame', background='#17367a')
-        style.configure('Brand.TLabel', background='#17367a', foreground='white', font=('Microsoft YaHei UI',22,'bold'))
-        style.configure('BrandSub.TLabel', background='#17367a', foreground='#d5e5ff')
-        header = ttk.Frame(root, style='Brand.TFrame', padding=(18,11))
+        self.configure_theme()
+        header = ttk.Frame(root,style='Surface.TFrame',padding=self.pads(18,5))
         header.pack(fill='x')
         ttk.Label(header,text='ChatFiles',style='Brand.TLabel').pack(side='left')
-        ttk.Label(header,text='按对话查看文件',style='BrandSub.TLabel').pack(side='left',padx=16)
-        ttk.Button(header,text='手动选择 ChatGPT 对话目录',command=self.settings).pack(side='right')
+        ttk.Label(header,text='对话文件管理',style='SurfaceMuted.TLabel').pack(side='left',padx=self.px(12))
+        ttk.Button(header,text='对话目录设置',command=self.settings).pack(side='right')
+        ttk.Label(header,text='v'+VERSION,style='SurfaceMuted.TLabel').pack(side='right',padx=self.px(12))
 
-        toolbar = ttk.Frame(root,padding=(16,10))
-        toolbar.pack(fill='x')
-        ttk.Label(toolbar,text='搜索对话').pack(side='left',padx=(0,8))
-        ttk.Entry(toolbar,textvariable=self.query,width=32).pack(side='left')
-        self.query.trace_add('write',lambda *_:self.render_threads())
-        self.scan_all_btn=ttk.Button(toolbar,text='刷新大小',style='Blue.TButton',command=self.scan_all)
-        self.scan_all_btn.pack(side='left',padx=8)
-
-        summary = ttk.Frame(root,padding=(18,0,18,10))
-        summary.pack(fill='x')
-        ttk.Label(summary,textvariable=self.total_info,font=('Microsoft YaHei UI',14,'bold')).pack(anchor='w')
-        ttk.Label(summary,textvariable=self.total_detail,foreground='#43597a',wraplength=900).pack(anchor='w')
-
-        panes=ttk.Panedwindow(root,orient='horizontal')
-        panes.pack(fill='both',expand=True,padx=16)
-        left=ttk.Frame(panes)
-        right=ttk.Frame(panes,padding=(8,0,0,0))
-        panes.add(left,weight=2)
+        ttk.Separator(root).pack(fill='x')
+        panes = ttk.Panedwindow(root,orient='horizontal')
+        left = ttk.Frame(panes,style='Sidebar.TFrame',padding=self.pads(12,10))
+        right = ttk.Frame(panes,style='Surface.TFrame',padding=self.pads(15,10))
+        panes.add(left,weight=1)
         panes.add(right,weight=3)
-        self.tree=self.table(left,[('title','对话名称',275),('size','大小 ↕',100),('shared','关联情况',100)],'browse')
+        self.sidebar_button = ttk.Button(header,text='隐藏侧栏',command=self.toggle_sidebar)
+        self.sidebar_button.pack(side='right',padx=self.px(4))
+        self.panes = panes
+        self.sidebar = left
+        self.sidebar_width = None
+
+        summary = ttk.Frame(left,style='Accent.TFrame',padding=self.pads(9,6))
+        summary.pack(side='bottom',fill='x',pady=self.pads(8,0))
+        ttk.Label(summary,textvariable=self.total_info,style='Metric.TLabel').pack(fill='x')
+        summary_detail = ttk.Label(summary,textvariable=self.total_detail,style='Accent.TLabel')
+        summary_detail.pack(fill='x')
+        self.wrap_to(summary_detail,4)
+
+        ttk.Label(left,text='对话',style='SidebarSection.TLabel').pack(anchor='w',pady=self.pads(0,5))
+        toolbar = ttk.Frame(left,style='Sidebar.TFrame')
+        toolbar.pack(fill='x',pady=self.pads(0,8))
+        self.scan_all_btn = ttk.Button(toolbar,text='刷新大小',command=self.scan_all)
+        self.scan_all_btn.pack(side='right',padx=self.pads(5,0))
+        search = ttk.Frame(toolbar,style='Sidebar.TFrame')
+        search.pack(side='left',fill='x',expand=True)
+        ttk.Label(search,text='搜索对话',style='SidebarMuted.TLabel').pack(anchor='w')
+        ttk.Entry(search,textvariable=self.query,width=8).pack(fill='x')
+        self.query.trace_add('write',lambda *_:self.render_threads())
+
+        self.tree = self.table(left,[('title','对话名称',175),('size','大小 ↕',76),('shared','关联',85)],'browse')
         self.tree.heading('size',command=self.sort_by_size)
         self.tree.bind('<<TreeviewSelect>>',self.selected)
-        self.info=tk.StringVar(value='选择一条对话查看文件。')
-        ttk.Label(right,textvariable=self.info,wraplength=610,padding=(2,4,2,8)).pack(fill='x')
-        actions=ttk.Frame(right)
-        actions.pack(fill='x')
-        self.rescan_btn=ttk.Button(actions,text='扫描此目录',command=self.scan_current)
-        self.rescan_btn.pack(side='left')
-        ttk.Button(actions,text='打开目录',command=self.open_folder).pack(side='left',padx=5)
-        ttk.Button(actions,text='导出清单',command=self.export).pack(side='left')
-        filters=ttk.Frame(right,padding=(0,8))
-        filters.pack(fill='x')
-        ttk.Combobox(filters,textvariable=self.category,values=['全部类型',*FILE_TYPES,'其他'],state='readonly',width=14).pack(side='left')
-        ttk.Combobox(filters,textvariable=self.min_size,values=['全部大小','≥ 10 MB','≥ 100 MB','≥ 1 GB'],state='readonly',width=12).pack(side='left',padx=6)
-        ttk.Label(filters,text='查找文件').pack(side='left',padx=(2,5))
-        ttk.Entry(filters,textvariable=self.file_query).pack(side='left',fill='x',expand=True)
 
-        self.file_tree=self.table(right,[('name','文件名',250),('size','大小',90),('path','相对路径',250)],'extended')
+        ttk.Label(right,text='工作目录',style='Section.TLabel').pack(anchor='w')
+        self.info = tk.StringVar(value='选择一条对话查看文件。')
+        info = ttk.Label(right,textvariable=self.info,style='SurfaceMuted.TLabel',padding=self.pads(0,3,0,5))
+        info.pack(fill='x')
+        self.wrap_to(info)
+        notice = ttk.Label(right,text='工作目录可能含源码、报告和原始素材。清理前请核对文件用途。',style='Notice.TLabel',justify='left',padding=self.pads(8,5))
+        notice.pack(fill='x',pady=self.pads(0,7))
+        self.wrap_to(notice,18)
+
+        actions = ttk.Frame(right,style='Surface.TFrame')
+        actions.pack(fill='x')
+        self.rescan_btn = ttk.Button(actions,text='扫描目录',command=self.scan_current)
+        self.rescan_btn.pack(side='left')
+        ttk.Button(actions,text='打开目录',command=self.open_folder).pack(side='left',padx=self.px(4))
+        ttk.Button(actions,text='导出清单',command=self.export).pack(side='left')
+        filters = ttk.Frame(right,style='Surface.TFrame',padding=self.pads(0,6))
+        filters.pack(fill='x')
+        filters.columnconfigure(3,weight=1)
+        ttk.Combobox(filters,textvariable=self.category,values=['全部类型',*FILE_TYPES,'其他'],state='readonly',font=('Microsoft YaHei UI',10),width=8).grid(row=0,column=0,sticky='ew',padx=self.pads(0,4))
+        ttk.Combobox(filters,textvariable=self.min_size,values=['全部大小','≥ 10 MB','≥ 100 MB','≥ 1 GB'],state='readonly',font=('Microsoft YaHei UI',10),width=8).grid(row=0,column=1,sticky='ew')
+        ttk.Label(filters,text='文件名',style='SurfaceMuted.TLabel').grid(row=0,column=2,sticky='w',padx=self.pads(5,3))
+        ttk.Entry(filters,textvariable=self.file_query,width=8).grid(row=0,column=3,sticky='ew')
+
+
+        self.file_tree=self.table(right,[('name','文件名',144),('size','大小',75),('path','相对路径',115)],'extended')
         self.file_tree.bind('<<TreeviewSelect>>',self.update_selection)
         self.file_tree.bind('<Double-1>',self.open_file_row)
         self.folder_keys = {}
         for variable in (self.file_query,self.category,self.min_size):
             variable.trace_add('write',self.schedule_filter)
 
-        selection_bar=ttk.Frame(root,padding=(16,9))
-        selection_bar.pack(fill='x')
-        ttk.Label(selection_bar,textvariable=self.selection_info).pack(side='left')
+        selection_bar=ttk.Frame(root,style='Surface.TFrame',padding=self.pads(16,5))
+
+        ttk.Label(selection_bar,textvariable=self.selection_info,style='SurfaceMuted.TLabel').pack(side='left')
         self.clean_btn=ttk.Button(selection_bar,text='移入回收站…',style='Danger.TButton',command=self.clean,state='disabled')
         self.delete_directory_btn=ttk.Button(selection_bar,text='删除整个目录…',style='Danger.TButton',command=lambda:self.clean(True),state='disabled')
         self.delete_directory_btn.pack(side='right')
         self.clean_btn.pack(side='right',padx=(0,8))
-        ttk.Label(root,textvariable=self.status,wraplength=900,padding=(16,5)).pack(fill='x')
-        root.after(100,self.poll)
+        status_label = ttk.Label(root,textvariable=self.status,padding=self.pads(16,4))
+        status_label.pack(side='bottom',fill='x')
+        selection_bar.pack(side='bottom',fill='x',pady=self.pads(5,0))
+        self.wrap_to(status_label,34)
+        # Reserve room for the bottom controls before allocating the tables.
+        panes.pack(fill='both',expand=True)
+        def initial_split():
+            if str(self.sidebar) in self.panes.panes():
+                self.panes.sashpos(0,round(self.panes.winfo_width()*0.36))
+        root.after_idle(initial_split)
+        root.bind('<Control-Shift-s>',self.toggle_sidebar)
+        self.poll_timer = root.after(100,self.poll)
         if self.db.get() and '--smoke-test' not in sys.argv:root.after(200,self.load)
+    def toggle_sidebar(self, event=None):
+        if str(self.sidebar) in self.panes.panes():
+            self.sidebar_width = self.panes.sashpos(0)
+            self.panes.forget(self.sidebar)
+            self.sidebar_button.configure(text='显示侧栏')
+        else:
+            self.panes.insert(0,self.sidebar,weight=1)
+            if self.sidebar_width is not None:
+                self.panes.sashpos(0,min(self.sidebar_width,self.panes.winfo_width()//2))
+            self.sidebar_button.configure(text='隐藏侧栏')
+        return 'break'
+
+    def px(self,value):
+        return max(1, round(value*self.scale)) if value else 0
+
+    def pads(self,*values):
+        return tuple(self.px(value) for value in values)
+
+    def wrap_to(self, label, inset=0):
+        def resize(event):
+            label.configure(wraplength=max(self.px(80),event.width-self.px(inset)))
+        label.bind('<Configure>',resize)
+
+    def configure_theme(self):
+        style = ttk.Style(self.root)
+        style.theme_use('clam')
+        style.configure('.',font=('Microsoft YaHei UI',10),background='#f6f6f8',foreground='#252529')
+        style.configure('Surface.TFrame',background='white')
+        style.configure('Sidebar.TFrame',background='#eceef2')
+        style.configure('SidebarSection.TLabel',background='#eceef2',foreground='#31343c',font=('Microsoft YaHei UI',12,'bold'))
+        style.configure('SidebarMuted.TLabel',background='#eceef2',foreground='#515662')
+        style.configure('Sidebar.Treeview',background='#eceef2',fieldbackground='#eceef2')
+        style.configure('Sidebar.Treeview.Heading',background='#eceef2',foreground='#515662')
+        style.configure('Brand.TLabel',background='white',foreground='#232327',font=('Microsoft YaHei UI',20,'bold'))
+        style.configure('Section.TLabel',background='white',foreground='#18273e',font=('Microsoft YaHei UI',12,'bold'))
+        style.configure('SurfaceMuted.TLabel',background='white',foreground='#485a72')
+        style.configure('Accent.TFrame',background='#e6e8ed')
+        style.configure('Accent.TLabel',background='#e6e8ed',foreground='#4c515d')
+        style.configure('Metric.TLabel',background='#e6e8ed',foreground='#24262c',font=('Microsoft YaHei UI',11,'bold'))
+        style.configure('Notice.TLabel',background='#fff4d6',foreground='#694500')
+        style.configure('Treeview',rowheight=self.px(31),background='white',fieldbackground='white',borderwidth=0,relief='flat')
+        style.configure('Treeview.Heading',font=('Microsoft YaHei UI',9,'bold'),background='#f3f3f6',foreground='#44464e',relief='flat',padding=self.pads(6,5))
+        for direction in ('Vertical','Horizontal'):
+            style.configure(direction+'.TScrollbar',background='#b8bac3',troughcolor='#f2f2f5',
+                            bordercolor='#f2f2f5',lightcolor='#b8bac3',darkcolor='#b8bac3',
+                            arrowsize=self.px(9),borderwidth=0,relief='flat')
+        style.map('Treeview',background=[('selected','#dceaff')],foreground=[('selected','#103c81')])
+        style.configure('TEntry',padding=self.pads(6,4),fieldbackground='white',bordercolor='#c7d4e6')
+        style.configure('TCombobox',font=('Microsoft YaHei UI',10),padding=self.pads(4,3),bordercolor='#c7d4e6')
+        style.map('TCombobox',fieldbackground=[('readonly','white')])
+        for role, base, hover, ink in [
+            ('TButton','#eeeef2','#e1e2e8','#292b32'),
+            ('Blue.TButton','#1857db','#1245b7','white'),
+            ('Danger.TButton','#fdebed','#f9d9de','#a61c31'),
+        ]:
+            style.configure(role,background=base,foreground=ink,padding=self.pads(9,5),
+                            width=0,borderwidth=1,relief='flat',bordercolor=base,lightcolor=base,darkcolor=base)
+            style.map(role,background=[('disabled','#e6ebf3'),('pressed',hover),('active',hover)],
+                      foreground=[('disabled','#66758c'),('!disabled',ink)],
+                      bordercolor=[('focus','#527ad2')])
+
     def table(self,parent,columns,selection):
         box=ttk.Frame(parent);box.pack(fill='both',expand=True);tree=ttk.Treeview(box,columns=[c[0] for c in columns],show='headings',selectmode=selection)
-        for name,title,width in columns:tree.heading(name,text=title);tree.column(name,width=width,minwidth=65,anchor='e' if name=='size' else 'w',stretch=name!='size')
+        for name,title,width in columns:tree.heading(name,text=title);tree.column(name,width=self.px(width),minwidth=self.px(54),anchor='e' if name=='size' else 'w',stretch=name!='size')
+        if selection == 'browse':
+            tree.configure(style='Sidebar.Treeview')
+            def fit_conversations(event):
+                available = event.width
+                size = self.px(76)
+                relation = self.px(69)
+                tree.column('size',width=size,stretch=False)
+                tree.column('shared',width=relation,stretch=False)
+                tree.column('title',width=max(self.px(60),available-size-relation),stretch=False)
+            tree.bind('<Configure>',fit_conversations)
+        tree.tag_configure('stripe',background='#f7f7fa')
         y=ttk.Scrollbar(box,orient='vertical',command=tree.yview);x=ttk.Scrollbar(box,orient='horizontal',command=tree.xview);tree.configure(yscrollcommand=y.set,xscrollcommand=x.set);tree.grid(row=0,column=0,sticky='nsew');y.grid(row=0,column=1,sticky='ns');x.grid(row=1,column=0,sticky='ew');box.rowconfigure(0,weight=1);box.columnconfigure(0,weight=1);return tree
     def settings(self):
         window = tk.Toplevel(self.root)
@@ -425,7 +540,7 @@ class App:
                 included.add(path)
                 if self.sizes.get(path,'').endswith('（部分）'):
                     partial += 1
-        self.total_info.set(f'对话目录合计（去重）　{human(total) if included else "—"}')
+        self.total_info.set(f'目录合计（去重）　{human(total) if included else "—"}')
         details = [f'已计入 {len(included)} 个目录']
         shared = len(self.threads) - len(paths)
         if shared or nested:
@@ -447,7 +562,7 @@ class App:
         if not self.active:return
         p=self.active['path'];related=conflicts(p,self.threads);self.files=self.cache.get(p,([],[]))[0]
         count_text=f'{len(self.files):,} 个文件 / {self.sizes.get(p,"等待统计")}' if p in self.cache else '等待加载文件列表'
-        self.info.set(self.active['title']+'\n'+p+f'\n{count_text}；关联 {len(related)} 条对话'+('；共享或嵌套目录，清理会影响其他对话。' if len(related)>1 else '；只表示工作目录关联，不证明文件创建来源。'))
+        self.info.set(self.active['title']+'\n'+p+f'\n{count_text} · 关联 {len(related)} 条对话'+(' · 共享或嵌套目录' if len(related)>1 else ''))
         self.render_files()
 
     def render_files(self):
@@ -483,7 +598,7 @@ class App:
             if count >= 15000:
                 self.status.set('结果超过 15,000 项，请继续筛选或导出清单。')
                 break
-            key = self.file_tree.insert('','end',values=(os.path.basename(path),human(size),os.path.relpath(path,folder)))
+            key = self.file_tree.insert('','end',values=(os.path.basename(path),human(size),os.path.relpath(path,folder)),tags=('stripe',) if count % 2 else ())
             self.file_keys[key] = row
             count += 1
         self.update_selection()
@@ -528,7 +643,7 @@ class App:
                     if value and self.sort_descending:self.render_threads()
                     if value and self.active and self.active['path'] not in self.cache:self.scan_current()
         except queue.Empty:pass
-        self.root.after(100,self.poll)
+        self.poll_timer = self.root.after(100,self.poll)
     def open_folder(self):
         if self.active and os.path.isdir(self.active['path']):os.startfile(self.active['path'])
     def export(self):
@@ -553,11 +668,16 @@ class App:
             self.show_cleanup_result(workspace,'软件未执行清理','\n'.join(skipped[:10]),protected=True)
             return
         related=conflicts(self.active['path'],self.threads)
-        win=tk.Toplevel(self.root);win.title('确认具体清理范围');win.geometry('780x520');win.transient(self.root);win.grab_set()
+        win=tk.Toplevel(self.root);win.title('确认具体清理范围');win.geometry(f'{min(self.px(780),desktop_size(self.root)[0]-32)}x{min(self.px(540),desktop_size(self.root)[1]-60)}');win.transient(self.root);win.grab_set()
         ttk.Label(win,text='准备将整个工作目录及其内容移入回收站' if whole_directory else f'准备将 {len(paths)} 个文件移入回收站',font=('Microsoft YaHei UI',14,'bold')).pack(anchor='w',padx=16,pady=12)
+        if whole_directory:
+            ttk.Label(win,text=WORKSPACE_NOTICE+' 整目录清理会一并移动其中的源码、成果及其他文件。',
+                      background='#fff1c8',foreground='#694500',wraplength=710,
+                      justify='left',padding=(10,7)).pack(fill='x',padx=16,pady=(0,8))
         ttk.Label(win,text=f'不会清除对话本身。受保护/已不存在的 {len(skipped)} 项将保留。若 Windows 提示永久删除，请取消。',wraplength=740).pack(anchor='w',padx=16)
         text=tk.Text(win,wrap='word',height=18);text.pack(fill='both',expand=True,padx=16,pady=10);text.insert('end','关联对话：\n'+'\n'.join(t['title'] for t in related)+'\n\n将处理的路径：\n'+'\n'.join(paths)+'\n\n跳过项：\n'+'\n'.join(skipped));text.configure(state='disabled')
-        accept=tk.BooleanVar();ttk.Checkbutton(win,text='我已核对清理范围和关联对话',variable=accept).pack(anchor='w',padx=16)
+        accept=tk.BooleanVar()
+        ttk.Checkbutton(win,text='我已核对清理范围和关联对话',variable=accept).pack(anchor='w',padx=16)
         def execute():
             if not accept.get():messagebox.showinfo('需要核对','请先核对范围并勾选。',parent=win);return
             try:
@@ -586,7 +706,13 @@ class App:
                 messagebox.showwarning('列表刷新失败',f'回收站操作已结束，请手动刷新大小。\n{ex}',parent=self.root)
             if failure:
                 self.show_cleanup_result(workspace,'清理未全部完成',failure)
-        buttons=ttk.Frame(win);buttons.pack(fill='x',padx=16,pady=12);ttk.Button(buttons,text='取消',command=win.destroy).pack(side='right');ttk.Button(buttons,text='确认删除整个目录' if whole_directory else '确认移入回收站',style='Danger.TButton',command=execute).pack(side='right',padx=8)
+        buttons=ttk.Frame(win);buttons.pack(fill='x',padx=16,pady=12);cancel = ttk.Button(buttons,text='取消',command=win.destroy)
+        cancel.pack(side='right')
+        confirm = ttk.Button(buttons,text='确认删除整个目录' if whole_directory else '确认移入回收站',style='Danger.TButton',command=execute,state='disabled')
+        confirm.pack(side='right',padx=8)
+        accept.trace_add('write',lambda *_:confirm.configure(state='normal' if accept.get() else 'disabled'))
+        win.bind('<Escape>',lambda event:win.destroy())
+        cancel.focus_set()
 
     def show_cleanup_result(self, workspace, title, reason, *, protected=False, parent=None):
         owner = parent or self.root
@@ -628,6 +754,7 @@ class App:
         ttk.Label(frame,textvariable=feedback,wraplength=640).pack(fill='x',pady=(6,0))
 
 if __name__=='__main__':
+    configure_windows_dpi()
     root=tk.Tk()
     if '--smoke-test' in sys.argv:
         root.withdraw();app=App(root);app.load();root.update()
